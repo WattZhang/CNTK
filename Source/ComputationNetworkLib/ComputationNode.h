@@ -1424,6 +1424,66 @@ public:
         MaskMissingColumnsTo(*m_gradient, m_pMBLayout, fr, Matrix<ElemType>::MakeNan(__LINE__));
     }
 
+    static std::shared_ptr<Matrix<ElemType>> UnpackMatrix(const Matrix<ElemType>& packedData,
+                                                          const MBLayoutPtr& layout,
+                                                          const std::shared_ptr<Matrix<ElemType>>& unpackedDataStorage,
+                                                          const std::shared_ptr<Matrix<ElemType>>& tempIndicesStorage,
+                                                          bool maskGaps,
+                                                          bool batchContiguous)
+    {
+        size_t maxNumTimeSteps = 1;
+        size_t numSequences = 1;
+        if (layout != nullptr)
+        {
+            maxNumTimeSteps = layout->GetNumTimeSteps();
+            numSequences = layout->GetNumSequences();
+        }
+
+        if ((maxNumTimeSteps == 1) || (numSequences == 1))
+            return std::make_shared<Matrix<ElemType>>(packedData.AsReference());
+
+        auto unpackedData = unpackedDataStorage;
+        if (!unpackedData)
+            unpackedData = std::make_shared<Matrix<ElemType>>(packedData.GetNumRows(), maxNumTimeSteps * numSequences, packedData.GetDeviceId(), packedData.GetMatrixType(), packedData.GetFormat());
+        else
+            unpackedData->Resize(packedData.GetNumRows(), maxNumTimeSteps * numSequences);
+
+        if (maskGaps)
+            unpackedData->SetValue(0.0f);
+
+        size_t i = 0;
+        auto& layoutSequences = layout->GetAllSequences();
+        std::vector<ElemType> scatterIndicesVector(layout->GetNumCols(), -1);
+        for (auto sequenceInfo : layoutSequences)
+        {
+            if (sequenceInfo.seqId != GAP_SEQUENCE_ID)
+            {
+                size_t targetParallelStreamIdx = sequenceInfo.s;
+                auto currentSequenceBeginIdx = std::max<ptrdiff_t>(0, sequenceInfo.tBegin);
+                auto currentSequenceEndIdx = std::min(maxNumTimeSteps, sequenceInfo.tEnd);
+                size_t currentSequenceLength = (currentSequenceEndIdx - currentSequenceBeginIdx);
+
+                for (size_t j = 0; j < currentSequenceLength; ++j)
+                {
+                    auto targetIdx = (ElemType)(batchContiguous ? ((j * numSequences) + i) : ((i * maxNumTimeSteps) + j));
+                    scatterIndicesVector[((currentSequenceBeginIdx + j) * layout->GetNumParallelSequences()) + targetParallelStreamIdx] = targetIdx;
+                }
+
+                i++;
+            }
+        }
+
+        auto scatterIdxMatrix = tempIndicesStorage;
+        if (!scatterIdxMatrix)
+            scatterIdxMatrix = std::make_shared<Matrix<ElemType>>(1, layout->GetNumCols(), scatterIndicesVector.data(), packedData.GetDeviceId());
+        else
+            scatterIdxMatrix->SetValue(1, layout->GetNumCols(), packedData.GetDeviceId(), scatterIndicesVector.data());
+
+        unpackedData->DoScatterColumnsOf(0, *scatterIdxMatrix, packedData, 1);
+
+        return unpackedData;
+    }
+
     // -----------------------------------------------------------------------
     // accessors for value and gradient
     // -----------------------------------------------------------------------

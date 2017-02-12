@@ -275,38 +275,97 @@ public:
     {
         // enforce compatibility of 'dataInput' with 'layoutInput'
         // TODO: how to deal with boundary flags?
-        if (InputRef(0).GetMBLayout() && (*m_pMBLayout != *InputRef(0).GetMBLayout())) // this does a deep value-level comparison
+
+        // this does a deep value-level comparison
+        auto layoutsMatch = InputRef(0).GetMBLayout() && (*m_pMBLayout == *InputRef(0).GetMBLayout());
+        if (InputRef(0).GetMBLayout() && !layoutsMatch &&
+            ((InputRef(0).GetMBLayout()->GetNumTimeSteps() != 1) || (InputRef(0).GetMBLayout()->GetNumSequences() != m_pMBLayout->GetNumSequences()) || !fr.IsAllFrames()))
+        {
             InvalidArgument("%ls %ls operation discovered that %ls %ls operation produced an MB layout that is incompatible with that of %ls %ls.",
                             NodeName().c_str(), OperationName().c_str(),
                             InputRef(0).NodeName().c_str(), InputRef(0).OperationName().c_str(),
                             InputRef(1).NodeName().c_str(), InputRef(1).OperationName().c_str());
+        }
 
-        // copy the data from 'dataInput'
-        size_t rank = GetSampleLayout().GetRank();
-        auto result = ValueTensorFor(rank, fr);
-        auto input0 = InputRef(0).ValueTensorFor(rank, InputRef(0).GetMBLayout() ? fr.WithLayout(InputRef(0).GetMBLayout()) : fr.AllowBroadcast());
-        result.AssignCopyOf(input0);
-        // TODO: Once we do in-place, the above must include a copy-to-self check (either here or inside the tensor lib).
+        if (!InputRef(0).GetMBLayout() || layoutsMatch)
+        {
+            // copy the data from 'dataInput'
+            size_t rank = GetSampleLayout().GetRank();
+            auto result = ValueTensorFor(rank, fr);
+            auto input0 = InputRef(0).ValueTensorFor(rank, InputRef(0).GetMBLayout() ? fr.WithLayout(InputRef(0).GetMBLayout()) : fr.AllowBroadcast());
+            result.AssignCopyOf(input0);
+            // TODO: Once we do in-place, the above must include a copy-to-self check (either here or inside the tensor lib).
+        }
+        else
+        {
+            // Broadcast along the sequence by calling scatter
+            auto& srcMatrix = InputRef(0).Value();
+            auto destMatrix = ValueFor(fr);
+
+            // Generate the gather indices
+            std::vector<ElemType> gatherIndicesVector(m_pMBLayout->GetNumCols(), -1);
+            auto& layoutSequences = m_pMBLayout->GetAllSequences();
+            for (auto sequenceInfo : layoutSequences)
+            {
+                if (sequenceInfo.seqId != GAP_SEQUENCE_ID)
+                {
+                    auto srcSequenceInfo = InputRef(0).GetMBLayout()->FindSequence(sequenceInfo.seqId);
+                    auto currentSequenceColumnIndices = m_pMBLayout->GetColumnIndices(sequenceInfo);
+                    auto gatherFromIndex = InputRef(0).GetMBLayout()->GetColumnIndex(srcSequenceInfo, 0);
+                    for (auto i : currentSequenceColumnIndices)
+                        gatherIndicesVector[i] = (ElemType)gatherFromIndex;
+                }
+            }
+
+            auto gatherIdxMatrix = std::make_shared<Matrix<ElemType>>(1, m_pMBLayout->GetNumCols(), gatherIndicesVector.data(), destMatrix.GetPreferredDeviceId());
+            destMatrix.DoGatherColumnsOf(0, *gatherIdxMatrix, srcMatrix, 1);
+        }
     }
 
     virtual void /*ComputationNode::*/ BackpropTo(const size_t inputIndex, const FrameRange& fr) override
     {
         if (inputIndex == 0)
         {
-            size_t rank = GetSampleLayout().GetRank();
-            auto gradient = GradientTensorFor(rank, fr);
-            auto inputGradient = Input(inputIndex)->GradientTensorFor(rank, InputRef(inputIndex).GetMBLayout() ? fr.WithLayout(InputRef(inputIndex).GetMBLayout()) : fr.AllowBroadcast());
+            auto layoutsMatch = InputRef(0).GetMBLayout() && (*m_pMBLayout == *InputRef(0).GetMBLayout());
+            if (!InputRef(0).GetMBLayout() || layoutsMatch)
+            {
+                size_t rank = GetSampleLayout().GetRank();
+                auto gradient = GradientTensorFor(rank, fr);
+                auto inputGradient = Input(inputIndex)->GradientTensorFor(rank, InputRef(inputIndex).GetMBLayout() ? fr.WithLayout(InputRef(inputIndex).GetMBLayout()) : fr.AllowBroadcast());
 
-            // if reduction then mask the respective input(s) (zero out the gaps)
-            if (Input(inputIndex)->ReducesInTimeWrt(shared_from_this()))
-                MaskMissingGradientColumnsToZero(fr);
+                // if reduction then mask the respective input(s) (zero out the gaps)
+                if (Input(inputIndex)->ReducesInTimeWrt(shared_from_this()))
+                    MaskMissingGradientColumnsToZero(fr);
 
-            if (Input(inputIndex)->ParentOverwritesGradient())
-                inputGradient.AssignCopyOf(gradient);
+                if (Input(inputIndex)->ParentOverwritesGradient())
+                    inputGradient.AssignCopyOf(gradient);
+                else
+                    inputGradient.AddCopyOf(gradient);
+
+                // TODO: Once we do in-place, the above must include a copy-to-self check (pay special attention to adding vs. copying).
+            }
             else
-                inputGradient.AddCopyOf(gradient);
+            {
+                assert(fr.IsAllFrames());
+                MaskMissingGradientColumnsToZero(fr);
+                auto gradientMatrix = GradientFor(fr);
 
-            // TODO: Once we do in-place, the above must include a copy-to-self check (pay special attention to adding vs. copying).
+                auto nullSharedPtr = std::shared_ptr<Matrix<ElemType>>(nullptr);
+                auto unpackedGradientMatrixPtr = ComputationNode<ElemType>::UnpackMatrix(gradientMatrix, m_pMBLayout, nullSharedPtr, nullSharedPtr, true, true);
+
+                size_t rank = GetSampleLayout().GetRank();
+                TensorShape unpackedGradientShape = GetSampleLayout();
+                size_t i = rank;
+                unpackedGradientShape.AppendInPlace(i++, m_pMBLayout->GetNumSequences());
+                unpackedGradientShape.AppendInPlace(i++, m_pMBLayout->GetNumTimeSteps());
+                auto unpackedGradientTensor = TensorView<ElemType>(unpackedGradientMatrixPtr, unpackedGradientShape);
+
+                auto inputGradient = Input(inputIndex)->GradientTensorFor(rank, FrameRange(InputRef(inputIndex).GetMBLayout(), 0));
+                if (Input(inputIndex)->ParentOverwritesGradient())
+                    inputGradient.AssignCopyOf(unpackedGradientTensor);
+                else
+                    inputGradient.AddCopyOf(unpackedGradientTensor);
+            }
         }
     }
 
